@@ -1,65 +1,154 @@
-const express = require("express");
-const TelegramBot = require("node-telegram-bot-api");
-const cors = require("cors");
+require('dotenv').config();
 
-const TOKEN = process.env.BOT_TOKEN;
-const PORT = process.env.PORT || 3000;
-
-if (!TOKEN) {
-  throw new Error("BOT_TOKEN is not set");
-}
+const express = require('express');
+const pool = require('./db');
 
 const app = express();
-app.use(cors());
+const PORT = process.env.PORT || 3000;
 
-const bot = new TelegramBot(TOKEN, { polling: true });
+app.use(express.json());
 
-let tracks = [];
+app.get('/', (req, res) => {
+  res.json({
+    ok: true,
+    service: 'telegram-music-backend',
+  });
+});
 
-bot.on("channel_post", async (msg) => {
-  if (!msg.audio) return;
-
-  const track = {
-    id: msg.message_id,
-    title: msg.audio.title || msg.audio.file_name || "Unknown title",
-    artist: msg.audio.performer || "Unknown artist",
-    file_id: msg.audio.file_id,
-  };
-
-  const exists = tracks.some((item) => item.id === track.id);
-
-  if (!exists) {
-    tracks.push(track);
-    console.log("Track added:", track.title);
+app.get('/health/db', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT NOW() AS now');
+    res.json({
+      ok: true,
+      dbTime: result.rows[0].now,
+    });
+  } catch (error) {
+    console.error('DB health error:', error);
+    res.status(500).json({
+      ok: false,
+      error: 'Database connection failed',
+    });
   }
 });
 
-app.get("/", (req, res) => {
-  res.send("Music backend is running");
+app.get('/tracks', async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT *
+      FROM tracks
+      ORDER BY id DESC
+      LIMIT 100
+    `);
+
+    res.json(result.rows);
+  } catch (error) {
+    console.error('GET /tracks error:', error);
+    res.status(500).json({ error: 'Database error' });
+  }
 });
 
-app.get("/tracks", async (req, res) => {
-  try {
-    const result = [];
+function extractTrackData(msg) {
+  const audio = msg.audio || null;
+  const document = msg.document || null;
+  const media = audio || document;
 
-   for (const track of tracks) {
-  const file = await bot.getFile(track.file_id);
+  if (!media) {
+    return null;
+  }
 
-  const url = `https://api.telegram.org/file/bot${TOKEN}/${file.file_path}`;
+  const title =
+    audio?.title ||
+    document?.file_name ||
+    'Unknown title';
 
-  result.push({
-    ...track,
-    url
-  });
+  const artist =
+    audio?.performer ||
+    null;
+
+  const duration =
+    audio?.duration ||
+    null;
+
+  return {
+    title,
+    artist,
+    album: null,
+    year: null,
+    duration,
+    telegram_file_id: media.file_id,
+    telegram_chat_id: msg.chat?.id || null,
+    telegram_message_id: msg.message_id || null,
+    upload_status: 'uploaded',
+  };
 }
 
-    res.json(result);
+app.post('/telegram/webhook', async (req, res) => {
+  try {
+    const update = req.body;
+
+    if (!update || !update.channel_post) {
+      return res.sendStatus(200);
+    }
+
+    const msg = update.channel_post;
+    const track = extractTrackData(msg);
+
+    if (!track) {
+      return res.sendStatus(200);
+    }
+
+    const existing = await pool.query(
+      `
+      SELECT id
+      FROM tracks
+      WHERE telegram_chat_id = $1
+        AND telegram_message_id = $2
+      LIMIT 1
+      `,
+      [track.telegram_chat_id, track.telegram_message_id]
+    );
+
+    if (existing.rows.length === 0) {
+      await pool.query(
+        `
+        INSERT INTO tracks (
+          title,
+          artist,
+          album,
+          year,
+          duration,
+          telegram_file_id,
+          telegram_chat_id,
+          telegram_message_id,
+          upload_status
+        )
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+        `,
+        [
+          track.title,
+          track.artist,
+          track.album,
+          track.year,
+          track.duration,
+          track.telegram_file_id,
+          track.telegram_chat_id,
+          track.telegram_message_id,
+          track.upload_status,
+        ]
+      );
+
+      console.log('Track saved:', track.title);
+    } else {
+      console.log('Track already exists:', track.title);
+    }
+
+    return res.sendStatus(200);
   } catch (error) {
-    console.error("Error in /tracks:", error.message);
-    res.status(500).json({ error: "Failed to load tracks" });
+    console.error('Webhook error:', error);
+    return res.sendStatus(500);
   }
 });
 
 app.listen(PORT, () => {
-  console.log(`Server started on port ${PORT}`);
+  console.log(`Server is running on port ${PORT}`);
 });
